@@ -1,15 +1,30 @@
 import streamlit as st
-import requests
-import json
 import io
 import os
 import pandas as pd
 import matplotlib.pyplot as plt
 import time
 from datetime import datetime
+import json
+from typing import Dict, Any, List, Optional
+from dotenv import load_dotenv
 
-# Configuration
-API_URL = "http://127.0.0.1:8000"  # FastAPI backend URL
+# Import our AssignmentChecker
+from AssignmentChecker import AssignmentChecker
+
+# Import plagiarism detection
+from assistant.core.plagiarism import calculate_plagiarism, analyze_ai_content, extract_text_from_docx, read_text_file
+
+# Load environment variables
+load_dotenv()
+
+# Setup logging
+import logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# Initialize AssignmentChecker with vector database directly in Streamlit
+checker = AssignmentChecker(vector_db_dir="./vector_db")
 
 # Page configuration
 st.set_page_config(
@@ -123,39 +138,197 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-def check_api_status():
-    """Check if the FastAPI backend is running."""
-    try:
-        response = requests.get(f"{API_URL}/health", timeout=5)
-        return response.status_code == 200
-    except:
-        return False
+# Define our backend-like functions directly in Streamlit
 
-def display_server_status():
-    """Display the server status in the sidebar."""
-    api_status = check_api_status()
-    status_class = "status-online" if api_status else "status-offline"
-    status_text = "ONLINE" if api_status else "OFFLINE"
+class PlagiarismResult:
+    def __init__(self, score: float, ai_generated: bool, ai_analysis: Dict[str, Any], similarity_scores: List[float] = []):
+        self.score = score
+        self.ai_generated = ai_generated
+        self.ai_analysis = ai_analysis
+        self.similarity_scores = similarity_scores
+
+class AssignmentResponse:
+    def __init__(self, student_name: str, grade: str, feedback: str, analysis: Optional[str] = None, 
+                 document_id: Optional[str] = None, file_id: Optional[str] = None, 
+                 plagiarism: Optional[PlagiarismResult] = None, success: bool = True):
+        self.student_name = student_name
+        self.grade = grade
+        self.feedback = feedback
+        self.analysis = analysis
+        self.document_id = document_id
+        self.file_id = file_id
+        self.plagiarism = plagiarism
+        self.success = success
+
+def check_text_assignment(student_name: str, question: str, answer: str, reference_material: str = ""):
+    """
+    Check a text-based assignment submission.
+    """
+    logger.info(f"Checking text assignment for student: {student_name}")
     
-    st.sidebar.markdown(f"""
-    <div class="status-box {status_class}">
-        Server Status: {status_text}
-    </div>
-    """, unsafe_allow_html=True)
-    
-    if not api_status:
-        st.sidebar.warning("""
-        The backend server appears to be offline. 
-        - Check if uvicorn is running on port 8000
-        - Make sure there are no firewall issues
-        - Try refreshing the page
-        """)
+    try:
+        # Step 1: Check for plagiarism and AI-generated content
+        answer_text = answer
         
-        # Add a refresh button for convenience
-        if st.sidebar.button("Retry Connection"):
-            st.rerun()
+        # Create knowledge base from reference material if available
+        knowledge_base_texts = []
+        if reference_material:
+            knowledge_base_texts.append(reference_material)
+        
+        # Get AI content analysis first (includes perplexity and burstiness)
+        ai_analysis = analyze_ai_content(answer_text)
+        ai_result_text = ai_analysis['result']
+        
+        # Now calculate plagiarism score (which also uses perplexity)
+        plagiarism_score, similarity_scores = calculate_plagiarism(answer_text, knowledge_base_texts)
+        
+        # More aggressive AI detection logic - use OR instead of AND
+        # Detect AI content if:
+        # 1. The text pattern analysis suggests AI-generated content OR
+        # 2. The statistical score is above our lowered threshold of 20%
+        is_ai_generated = "AI Generated" in ai_result_text or plagiarism_score > 20
+        
+        # Log more detailed detection info
+        logger.info(f"Detailed AI detection - Score: {plagiarism_score:.2f}%, AI result: {ai_result_text}, Final decision: {is_ai_generated}")
+        
+        # Create plagiarism result
+        plagiarism_result = PlagiarismResult(
+            score=plagiarism_score,
+            ai_generated=is_ai_generated,
+            ai_analysis=ai_analysis,
+            similarity_scores=similarity_scores
+        )
+        
+        logger.info(f"Plagiarism score: {plagiarism_score:.2f}%, AI-generated: {is_ai_generated}")
+        
+        # Step 2: Only proceed with assignment checking if not flagged as AI-generated with high plagiarism
+        if is_ai_generated and plagiarism_score > 50:  # Lowered from 60 to catch more AI content
+            # For highly suspicious content, return early with a warning
+            return AssignmentResponse(
+                student_name=student_name,
+                grade="Failed",
+                feedback="This submission appears to be generated by AI tools or contains significant plagiarism. Our analysis indicates unusual language patterns. Please submit original work.",
+                analysis="Automatic grading skipped due to academic integrity concerns. The text demonstrates unusual perplexity and burstiness patterns consistent with AI-generated text.",
+                plagiarism=plagiarism_result,
+                success=False
+            )
+        
+        # Step 3: Proceed with normal assignment checking
+        result = checker.check_assignment(
+            question=question,
+            student_answer=answer,
+            student_name=student_name,
+            reference_material=reference_material
+        )
+        
+        # Step 4: Return combined results
+        return AssignmentResponse(
+            student_name=student_name,
+            grade=result["grade"],
+            feedback=result["feedback"],
+            analysis=result.get("analysis", ""),
+            document_id=result.get("document_id", ""),
+            plagiarism=plagiarism_result,
+            success=result.get("success", True)
+        )
     
-    return api_status
+    except Exception as e:
+        logger.error(f"Error checking assignment: {str(e)}")
+        st.error(f"Error checking assignment: {str(e)}")
+        return None
+
+def check_pdf_assignment(student_name: str, assignment_prompt: str, pdf_file, reference_material: str = ""):
+    """
+    Check an assignment submitted as a PDF file.
+    """
+    if not pdf_file.name.endswith('.pdf'):
+        st.error("File must be a PDF")
+        return None
+    
+    logger.info(f"Checking PDF assignment for student: {student_name}")
+    
+    try:
+        # Step 1: Process the PDF file
+        file_contents = pdf_file.read()
+        file_bytes = io.BytesIO(file_contents)
+        
+        # Extract text for plagiarism check
+        from PyPDF2 import PdfReader
+        reader = PdfReader(file_bytes)
+        extracted_text = ""
+        for page in reader.pages:
+            extracted_text += page.extract_text()
+        
+        # Reset file pointer for assignment checker
+        file_bytes.seek(0)
+        
+        # Step 2: Check for plagiarism and AI-generated content
+        knowledge_base_texts = []
+        if reference_material:
+            knowledge_base_texts.append(reference_material)
+        
+        # Get AI content analysis first (includes perplexity and burstiness)
+        ai_analysis = analyze_ai_content(extracted_text)
+        ai_result_text = ai_analysis['result']
+        
+        # Now calculate plagiarism score (which also uses perplexity)
+        plagiarism_score, similarity_scores = calculate_plagiarism(extracted_text, knowledge_base_texts)
+        
+        # More aggressive AI detection logic - use OR instead of AND
+        # Detect AI content if:
+        # 1. The text pattern analysis suggests AI-generated content OR
+        # 2. The statistical score is above our lowered threshold of 20%
+        is_ai_generated = "AI Generated" in ai_result_text or plagiarism_score > 20
+        
+        # Log more detailed detection info
+        logger.info(f"Detailed AI detection - Score: {plagiarism_score:.2f}%, AI result: {ai_result_text}, Final decision: {is_ai_generated}")
+        
+        # Create plagiarism result
+        plagiarism_result = PlagiarismResult(
+            score=plagiarism_score,
+            ai_generated=is_ai_generated,
+            ai_analysis=ai_analysis,
+            similarity_scores=similarity_scores
+        )
+        
+        logger.info(f"Plagiarism score: {plagiarism_score:.2f}%, AI-generated: {is_ai_generated}")
+        
+        # Step 3: Only proceed with assignment checking if not flagged as AI-generated with high plagiarism
+        if is_ai_generated and plagiarism_score > 50:  # Lowered from 60 to catch more AI content
+            # For highly suspicious content, return early with a warning
+            return AssignmentResponse(
+                student_name=student_name,
+                grade="Failed",
+                feedback="This submission appears to be generated by AI tools or contains significant plagiarism. Our analysis indicates unusual language patterns. Please submit original work.",
+                analysis="Automatic grading skipped due to academic integrity concerns. The text demonstrates unusual perplexity and burstiness patterns consistent with AI-generated text.",
+                plagiarism=plagiarism_result,
+                success=False
+            )
+        
+        # Step 4: Proceed with normal assignment checking
+        result = checker.check_pdf_assignment(
+            pdf_file=file_bytes,
+            assignment_prompt=assignment_prompt,
+            student_name=student_name,
+            reference_material=reference_material
+        )
+        
+        # Step 5: Return combined results
+        return AssignmentResponse(
+            student_name=student_name,
+            grade=result["grade"],
+            feedback=result["feedback"],
+            analysis=result.get("analysis", ""),
+            document_id=result.get("document_id", ""),
+            file_id=result.get("file_id", ""),
+            plagiarism=plagiarism_result,
+            success=result.get("success", True)
+        )
+    
+    except Exception as e:
+        logger.error(f"Error checking PDF assignment: {str(e)}")
+        st.error(f"Error checking PDF assignment: {str(e)}")
+        return None
 
 def display_progress(title, current_step, total_steps=3):
     """Display a simplified progress indicator for the assignment checking process."""
@@ -198,9 +371,9 @@ def display_plagiarism_results(plagiarism_data):
         return
     
     # Extract metrics from the data
-    score = plagiarism_data.get("score", 0)
-    is_ai_generated = plagiarism_data.get("ai_generated", False)
-    ai_analysis = plagiarism_data.get("ai_analysis", {})
+    score = plagiarism_data.score
+    is_ai_generated = plagiarism_data.ai_generated
+    ai_analysis = plagiarism_data.ai_analysis
     result_text = ai_analysis.get("result", "Unknown")
     perplexity = ai_analysis.get("perplexity", 0)
     
@@ -247,311 +420,252 @@ def display_plagiarism_results(plagiarism_data):
     """, unsafe_allow_html=True)
     
     # Add explanation of how the score is calculated
-    st.markdown("""
-    <div style="background-color: #f8f9fa; padding: 15px; border-radius: 5px; margin-bottom: 20px;">
-        <h3 style="color: #1565C0;">How AI Content Detection Works</h3>
-        <p style="color: #333333;">
-        This system uses two key metrics to identify potential AI-generated content:
-        </p>
-        <ul style="color: #333333;">
-            <li><strong>Perplexity:</strong> Measures how predictable the text is. AI-generated content typically has lower perplexity (more predictable patterns).</li>
-            <li><strong>Burstiness:</strong> Measures variation in word usage. AI writing often shows different patterns of word repetition than human writing.</li>
-        </ul>
-        <p style="color: #333333;">
-        Lower perplexity combined with unusual burstiness patterns suggests potential AI-generated content.
-        </p>
-    </div>
-    """, unsafe_allow_html=True)
-    
-    # Create visual representation of AI analysis
-    st.markdown("""
-    <div style="background-color: #f8f9fa; padding: 15px; border-radius: 5px; margin-bottom: 20px;">
-        <h3 style="color: #1565C0;">AI Content Analysis Metrics</h3>
-    </div>
-    """, unsafe_allow_html=True)
-    
-    col1, col2 = st.columns(2)
-    
-    with col1:
-        # Show explanation of the result
-        ai_result_explanation = ""
-        if "AI Generated" in result_text:
-            if score < 20:
-                ai_result_explanation = " (Low confidence - may be a false positive)"
-            else:
-                ai_result_explanation = " (High confidence)"
+    with st.expander("How is AI content detected?"):
+        st.markdown("""
+        Our system uses multiple detection techniques:
         
-        st.write(f"**Result:** {result_text}{ai_result_explanation}")
+        1. **Statistical analysis**: Measures text perplexity and burstiness patterns that differ between human and AI writing
+        2. **Pattern recognition**: Identifies language patterns typical of large language models
+        3. **Comparative analysis**: Evaluates consistency against reference materials
         
-        metrics = {
-            "Perplexity": ai_analysis.get("perplexity", 0),
-            "Burstiness": ai_analysis.get("burstiness", 0)
-        }
+        The final score is a composite of these factors, with higher scores indicating a higher probability of AI-generated content.
+        """)
         
-        # Create DataFrame for the metrics
-        metrics_df = pd.DataFrame(list(metrics.items()), columns=['Metric', 'Value'])
-        st.dataframe(metrics_df, hide_index=True)
-        
-        # Add an interpretation guide
-        if perplexity < 100:
-            perplexity_interp = "Very low perplexity - highly indicative of AI-generated text"
-        elif perplexity < 500:
-            perplexity_interp = "Low perplexity - potentially AI-generated text"
-        elif perplexity < 1000:
-            perplexity_interp = "Medium perplexity - could be human or AI text"
-        else:
-            perplexity_interp = "High perplexity - likely human-written text"
-            
-        st.write(f"**Perplexity interpretation:** {perplexity_interp}")
-    
-    with col2:
-        # Plot the metrics
-        fig, ax = plt.subplots(figsize=(4, 3))
-        ax.bar(metrics.keys(), metrics.values(), color=['#1E88E5', '#43A047'])
-        ax.set_title('AI Detection Metrics')
-        ax.set_ylabel('Value')
-        ax.grid(axis='y', alpha=0.3)
-        st.pyplot(fig)
+        # Show the specific values that contributed to the decision
+        st.markdown("### Detection Values")
+        st.markdown(f"- **Perplexity**: {perplexity:.2f}")
+        st.markdown(f"- **Pattern Analysis Result**: {result_text}")
+        st.markdown(f"- **Final Detection**: {'AI-Generated' if is_ai_generated else 'Likely Human'}")
 
 def text_assignment_tab():
-    """UI for submitting text assignments."""
-    st.markdown('<p class="sub-header">Text Assignment Submission</p>', unsafe_allow_html=True)
+    """UI for submitting text-based assignments"""
+    st.markdown("<h2 class='sub-header'>Text Assignment Checker</h2>", unsafe_allow_html=True)
     
-    # Form for text assignment
-    with st.form("text_assignment_form"):
-        student_name = st.text_input("Student Name", placeholder="Enter student name")
-        question = st.text_area("Assignment Question", placeholder="Enter the assignment question or prompt", height=150)
-        answer = st.text_area("Student Answer", placeholder="Enter the student's answer", height=300)
-        reference_material = st.text_area("Reference Material (Optional)", placeholder="Enter any reference material to compare against", height=150)
+    # Create form for assignment submission
+    with st.form(key="text_assignment_form"):
+        student_name = st.text_input("Student Name", placeholder="Enter your full name")
         
-        submit_button = st.form_submit_button("Check Assignment")
+        # Assignment question/prompt
+        question = st.text_area(
+            "Assignment Question/Prompt", 
+            placeholder="Enter the assignment question or instructions here",
+            height=100
+        )
+        
+        # Student's answer
+        answer = st.text_area(
+            "Your Answer", 
+            placeholder="Enter your complete answer here",
+            height=300
+        )
+        
+        # Reference material (optional)
+        reference_material = st.text_area(
+            "Reference Material (Optional)", 
+            placeholder="Enter any reference material, lecture notes, or textbook content to compare against",
+            height=150
+        )
+        
+        submit_button = st.form_submit_button("Submit Assignment")
     
+    # Process the submission when button is clicked
     if submit_button:
         if not student_name or not question or not answer:
-            st.error("Please fill in all required fields.")
+            st.error("Please fill in all required fields (Student Name, Question, and Answer)")
             return
         
-        # Show initial status
-        st.info("Processing assignment submission...")
-        display_progress("Assignment Check", 0, 3)
+        # Show progress indicator
+        display_progress("Processing Assignment", 0)
         
-        # Prepare request data
-        data = {
-            "student_name": student_name,
-            "question": question,
-            "answer": answer,
-            "reference_material": reference_material
-        }
-        
-        try:
-            # Step 1: Start plagiarism check
-            display_progress("Assignment Check", 1, 3)
+        # Process submission
+        with st.spinner("Processing your assignment..."):
+            # Step 1: Check for plagiarism
+            time.sleep(1)  # Simulated delay
+            display_progress("Checking Plagiarism", 1)
             
-            # Send request to FastAPI backend
-            with st.spinner("Checking assignment..."):
-                response = requests.post(
-                    f"{API_URL}/check-text-assignment",
-                    json=data,
-                    headers={"Content-Type": "application/json"},
-                    timeout=180  # 3-minute timeout for LLM processing
-                )
+            # Step 2: Grade assignment
+            time.sleep(1)  # Simulated delay
+            display_progress("Grading Assignment", 2)
             
-            # Step 2: Analysis and grading
-            display_progress("Assignment Check", 2, 3)
+            # Call backend function directly
+            result = check_text_assignment(
+                student_name=student_name,
+                question=question,
+                answer=answer,
+                reference_material=reference_material
+            )
             
-            # Step 3: Display results
-            display_progress("Assignment Check", 3, 3)
+            # Step 3: Complete and show results
+            display_progress("Completed", 3)
             
-            if response.status_code == 200:
-                result = response.json()
-                
-                # Display plagiarism results first
-                if "plagiarism" in result:
-                    display_plagiarism_results(result["plagiarism"])
-                
-                # Then display grading results
+            if result:
                 display_results(result)
-            else:
-                st.error(f"Error: {response.status_code} - {response.text}")
-        except requests.RequestException as e:
-            st.error(f"Error connecting to server: {str(e)}")
 
 def pdf_assignment_tab():
-    """UI for submitting PDF assignments."""
-    st.markdown('<p class="sub-header">PDF Assignment Submission</p>', unsafe_allow_html=True)
+    """UI for submitting PDF assignments"""
+    st.markdown("<h2 class='sub-header'>PDF Assignment Checker</h2>", unsafe_allow_html=True)
     
-    # Form for PDF assignment
-    with st.form("pdf_assignment_form"):
-        student_name = st.text_input("Student Name", placeholder="Enter student name")
-        assignment_prompt = st.text_area("Assignment Instructions", placeholder="Enter the assignment instructions", height=150)
-        reference_material = st.text_area("Reference Material (Optional)", placeholder="Enter any reference material to compare against", height=150)
-        uploaded_file = st.file_uploader("Upload PDF Assignment", type=["pdf"])
+    # Create form for PDF submission
+    with st.form(key="pdf_assignment_form"):
+        student_name = st.text_input("Student Name", placeholder="Enter your full name")
         
-        submit_button = st.form_submit_button("Check PDF Assignment")
+        # Assignment prompt
+        assignment_prompt = st.text_area(
+            "Assignment Question/Prompt", 
+            placeholder="Enter the assignment question or instructions here",
+            height=100
+        )
+        
+        # PDF file upload
+        pdf_file = st.file_uploader("Upload Assignment PDF", type=["pdf"])
+        
+        # Reference material (optional)
+        reference_material = st.text_area(
+            "Reference Material (Optional)", 
+            placeholder="Enter any reference material, lecture notes, or textbook content to compare against",
+            height=150
+        )
+        
+        submit_button = st.form_submit_button("Submit Assignment")
     
+    # Process the submission when button is clicked
     if submit_button:
-        if not student_name or not assignment_prompt or not uploaded_file:
-            st.error("Please fill in all required fields and upload a PDF file.")
+        if not student_name or not assignment_prompt or not pdf_file:
+            st.error("Please fill in all required fields (Student Name, Assignment Prompt, and PDF file)")
             return
         
-        # Show initial status
-        st.info("Processing PDF submission...")
-        display_progress("PDF Assignment Check", 0, 3)
+        # Show progress indicator
+        display_progress("Processing PDF Assignment", 0)
         
-        try:
-            # Prepare form data
-            form_data = {
-                "student_name": student_name,
-                "assignment_prompt": assignment_prompt,
-                "reference_material": reference_material
-            }
+        # Process submission
+        with st.spinner("Processing your PDF assignment..."):
+            # Step 1: Check for plagiarism
+            time.sleep(1)  # Simulated delay
+            display_progress("Checking Plagiarism", 1)
             
-            files = {
-                "pdf_file": (uploaded_file.name, uploaded_file, "application/pdf")
-            }
+            # Step 2: Grade assignment
+            time.sleep(1)  # Simulated delay
+            display_progress("Grading Assignment", 2)
             
-            # Step 1: Plagiarism check
-            display_progress("PDF Assignment Check", 1, 3)
+            # Call backend function directly
+            result = check_pdf_assignment(
+                student_name=student_name,
+                assignment_prompt=assignment_prompt,
+                pdf_file=pdf_file,
+                reference_material=reference_material
+            )
             
-            # Send request to FastAPI backend
-            with st.spinner("Processing PDF and checking assignment... This may take several minutes."):
-                response = requests.post(
-                    f"{API_URL}/check-pdf-assignment",
-                    data=form_data,
-                    files=files,
-                    timeout=300  # 5-minute timeout for PDF processing
-                )
+            # Step 3: Complete and show results
+            display_progress("Completed", 3)
             
-            # Step 2: Analysis and grading
-            display_progress("PDF Assignment Check", 2, 3)
-            
-            # Step 3: Display results
-            display_progress("PDF Assignment Check", 3, 3)
-            
-            if response.status_code == 200:
-                result = response.json()
-                
-                # Display plagiarism results first
-                if "plagiarism" in result:
-                    display_plagiarism_results(result["plagiarism"])
-                
-                # Then display grading results
+            if result:
                 display_results(result)
-            else:
-                st.error(f"Error: {response.status_code} - {response.text}")
-        except requests.RequestException as e:
-            st.error(f"Error connecting to server: {str(e)}")
 
 def display_results(result):
-    """Display the assignment checking results."""
-    st.markdown('<p class="result-header">Assignment Results</p>', unsafe_allow_html=True)
+    """Display the assignment checking results"""
+    st.markdown("<h2 class='result-header'>Assignment Results</h2>", unsafe_allow_html=True)
     
-    # Display grade with dark text on light background
+    # First show the plagiarism check results
+    st.markdown("<h3>Plagiarism & AI Content Analysis</h3>", unsafe_allow_html=True)
+    display_plagiarism_results(result.plagiarism)
+    
+    # Then show the grade in a prominent way
+    st.markdown("<h3>Grade</h3>", unsafe_allow_html=True)
     st.markdown(f"""
-    <div class="grade-display" style="color: #000000; background-color: #f0f7ff;">
-        <strong>Grade:</strong> {result.get('grade', 'No grade available')}
+    <div class="grade-display">
+        {result.grade}
     </div>
     """, unsafe_allow_html=True)
     
-    # Display feedback with dark text on light background
-    st.markdown('<p class="sub-header">Feedback</p>', unsafe_allow_html=True)
-    
-    # Apply styling to ensure text is visible
-    feedback_text = result.get('feedback', 'No feedback available').replace('\n', '<br>')
+    # Show feedback with improved formatting
+    st.markdown("<h3>Feedback</h3>", unsafe_allow_html=True)
     st.markdown(f"""
-    <div class="feedback-box" style="color: #000000; background-color: #f5f5f5;">
-        {feedback_text}
+    <div class="feedback-box">
+        {result.feedback}
     </div>
     """, unsafe_allow_html=True)
     
-    # Display analysis if available with dark text on light background
-    if result.get('analysis'):
-        with st.expander("View Detailed Analysis", expanded=False):
-            analysis_text = result.get('analysis', '').replace('\n', '<br>')
+    # Show detailed analysis in an expander
+    if result.analysis:
+        with st.expander("Detailed Analysis"):
             st.markdown(f"""
-            <div class="analysis-box" style="color: #000000; background-color: #f0f7ff;">
-                {analysis_text}
+            <div class="analysis-box">
+                {result.analysis}
             </div>
             """, unsafe_allow_html=True)
     
-    # Save results option
-    if st.button("Save Results"):
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        filename = f"results_{result.get('student_name', 'student').replace(' ', '_')}_{timestamp}.json"
-        
-        # Create results directory if it doesn't exist
-        os.makedirs("results", exist_ok=True)
-        
-        # Save results to file
-        with open(f"results/{filename}", "w") as f:
-            json.dump(result, f, indent=4)
-        
-        st.success(f"Results saved to results/{filename}")
-        
-        # Offer download
-        with open(f"results/{filename}", "r") as f:
-            st.download_button(
-                label="Download Results",
-                data=f,
-                file_name=filename,
-                mime="application/json"
-            )
+    # Add download button for the results as JSON
+    if st.button("Download Results"):
+        # Convert result to dict for JSON export
+        result_data = {
+            "student_name": result.student_name,
+            "grade": result.grade,
+            "feedback": result.feedback,
+            "analysis": result.analysis,
+            "plagiarism_score": result.plagiarism.score if result.plagiarism else 0,
+            "ai_generated": result.plagiarism.ai_generated if result.plagiarism else False,
+            "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        }
+        # Convert to JSON
+        json_result = json.dumps(result_data, indent=2)
+        # Create a download button
+        st.download_button(
+            label="Download Results as JSON",
+            data=json_result,
+            file_name=f"assignment_result_{result.student_name}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json",
+            mime="application/json"
+        )
 
-# Main application
 def main():
     # Display header
-    st.markdown('<h1 class="main-header">AI Teacher Assistant</h1>', unsafe_allow_html=True)
+    st.markdown("<h1 class='main-header'>AI Teacher Assistant</h1>", unsafe_allow_html=True)
     
-    # Check API status and display in sidebar
-    api_online = display_server_status()
+    # Add descriptive text
+    st.markdown("""
+    This tool helps teachers grade assignments and check for plagiarism or AI-generated content.
+    Submit either a text-based assignment or upload a PDF document to get started.
+    """)
     
     # Sidebar information
-    st.sidebar.markdown("## About")
-    st.sidebar.markdown("""
-    The AI Teacher Assistant helps educators automate assignment grading and feedback. 
-    Upload text or PDF assignments and receive AI-generated feedback and grades.
-    """)
-    
-    st.sidebar.markdown("## How it works")
-    st.sidebar.markdown("""
-    1. Submit your assignment (Text or PDF)
-    2. AI checks for plagiarism and AI-generated content
-    3. Assignment is analyzed and graded 
-    4. Detailed feedback is generated
-    5. Results are displayed with option to save
-    """)
-    
-    # Instructions for using the app in the sidebar
-    st.sidebar.markdown("## Instructions")
-    st.sidebar.markdown("""
-    **For Text Assignments:**
-    - Enter student name, question, and answer
-    - Optionally provide reference material
-    - Click "Check Assignment"
-    
-    **For PDF Assignments:**
-    - Enter student name and assignment instructions
-    - Upload a PDF file
-    - Optionally provide reference material
-    - Click "Check PDF Assignment"
-    """)
-    
-    if api_online:
-        # Create tabs
-        tab1, tab2 = st.tabs(["Text Assignment", "PDF Assignment"])
+    with st.sidebar:
+        st.markdown("## About")
+        st.markdown("""
+        **AI Teacher Assistant**
         
-        with tab1:
-            text_assignment_tab()
+        This application uses advanced AI to:
+        - Grade student assignments
+        - Detect plagiarism
+        - Identify AI-generated content
+        - Provide detailed feedback
         
-        with tab2:
-            pdf_assignment_tab()
-    else:
-        st.error("""
-        The backend server is currently offline. Please start the FastAPI server with:
-        ```
-        uvicorn app:app --reload
-        ```
+        No separate backend required - all processing happens within Streamlit!
         """)
+        
+        # Show environment status
+        st.markdown("### Environment Status")
+        
+        # Always show as online since everything is integrated
+        st.markdown("""
+        <div class="status-box status-online">
+            Status: ACTIVE
+        </div>
+        """, unsafe_allow_html=True)
+        
+        st.markdown("### Important Notes")
+        st.markdown("""
+        - Processing times vary based on assignment length
+        - Your data privacy is protected
+        - For educational use only
+        """)
+    
+    # Create tabs for different submission types
+    tab1, tab2 = st.tabs(["Text Assignment", "PDF Assignment"])
+    
+    with tab1:
+        text_assignment_tab()
+    
+    with tab2:
+        pdf_assignment_tab()
 
 if __name__ == "__main__":
     main() 
